@@ -1,0 +1,33 @@
+{
+  "_comment_generic_template": [
+    "This is a TEMPLATE for configuring bitbucket-dc-mcp in an",
+    "MCP-compatible client (Claude Desktop, Claude Code, etc.).",
+    "",
+    "How to use this file:",
+    "1. Copy this file to your MCP client config location",
+    "2. Replace EVERY placeholder value with your real values",
+    "3. Do NOT put real tokens directly in the 'env' section in",
+    "   production; instead, source them from a secret store and",
+    "   export them in the environment that launches your MCP client,",
+    "   or use a client that supports secret-store placeholders.",
+    "",
+    "See README.md for the list of supported environment variables",
+    "and SECURITY.md for the threat model and deployment requirements."
+  ],
+  "mcpServers": {
+    "bitbucket-dc": {
+      "command": "bitbucket-dc-mcp",
+      "env": {
+        "BITBUCKET_BASE_URL": "https://bitbucket.example.com",
+        "BITBUCKET_USERNAME": "your.username",
+        "BITBUCKET_TOKEN": "REPLACE_WITH_YOUR_HTTP_ACCESS_TOKEN",
+        "BITBUCKET_DEFAULT_PROJECT": "YOURPROJECT",
+        "BITBUCKET_WORKSPACE": "/absolute/path/to/your/workspace",
+        "BITBUCKET_ALLOWED_HOSTS": "bitbucket.example.com",
+        "BITBUCKET_GIT_TIMEOUT": "300",
+        "BITBUCKET_HTTP_TIMEOUT": "30",
+        "BITBUCKET_MAX_FILE_BYTES": "1048576"
+      }
+    }
+  }
+}
