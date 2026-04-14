@@ -129,3 +129,52 @@ class TestLoadConfig:
         monkeypatch.setenv("BITBUCKET_SESSION_ID", "custom-session-42")
         config = load_config()
         assert config.session_id == "custom-session-42"
+
+    def test_lfs_mode_default_is_disabled(self, monkeypatch, tmp_path):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("BITBUCKET_BASE_URL", "https://x.example.com")
+        monkeypatch.setenv("BITBUCKET_TOKEN", "t")
+        monkeypatch.setenv("BITBUCKET_USERNAME", "u")
+        monkeypatch.setenv("BITBUCKET_WORKSPACE", str(tmp_path))
+        config = load_config()
+        assert config.lfs_mode == "disabled"
+
+    def test_lfs_mode_enabled(self, monkeypatch, tmp_path):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("BITBUCKET_BASE_URL", "https://x.example.com")
+        monkeypatch.setenv("BITBUCKET_TOKEN", "t")
+        monkeypatch.setenv("BITBUCKET_USERNAME", "u")
+        monkeypatch.setenv("BITBUCKET_WORKSPACE", str(tmp_path))
+        monkeypatch.setenv("BITBUCKET_LFS_MODE", "enabled")
+        config = load_config()
+        assert config.lfs_mode == "enabled"
+
+    def test_lfs_mode_auto(self, monkeypatch, tmp_path):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("BITBUCKET_BASE_URL", "https://x.example.com")
+        monkeypatch.setenv("BITBUCKET_TOKEN", "t")
+        monkeypatch.setenv("BITBUCKET_USERNAME", "u")
+        monkeypatch.setenv("BITBUCKET_WORKSPACE", str(tmp_path))
+        monkeypatch.setenv("BITBUCKET_LFS_MODE", "auto")
+        config = load_config()
+        assert config.lfs_mode == "auto"
+
+    def test_lfs_mode_rejects_invalid_value(self, monkeypatch, tmp_path):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("BITBUCKET_BASE_URL", "https://x.example.com")
+        monkeypatch.setenv("BITBUCKET_TOKEN", "t")
+        monkeypatch.setenv("BITBUCKET_USERNAME", "u")
+        monkeypatch.setenv("BITBUCKET_WORKSPACE", str(tmp_path))
+        monkeypatch.setenv("BITBUCKET_LFS_MODE", "bogus")
+        with pytest.raises(ConfigError, match="LFS_MODE"):
+            load_config()
+
+    def test_lfs_mode_case_insensitive(self, monkeypatch, tmp_path):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("BITBUCKET_BASE_URL", "https://x.example.com")
+        monkeypatch.setenv("BITBUCKET_TOKEN", "t")
+        monkeypatch.setenv("BITBUCKET_USERNAME", "u")
+        monkeypatch.setenv("BITBUCKET_WORKSPACE", str(tmp_path))
+        monkeypatch.setenv("BITBUCKET_LFS_MODE", "ENABLED")
+        config = load_config()
+        assert config.lfs_mode == "enabled"

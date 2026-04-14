@@ -28,6 +28,7 @@ class ServerConfig:
     session_id: str
     audit_log_path: Path
     agent_id: str = "bitbucket-dc-mcp"
+    lfs_mode: str = "disabled"
 
 
 def _require_env(name: str) -> str:
@@ -93,7 +94,13 @@ def load_config() -> ServerConfig:
     token = _require_env("BITBUCKET_TOKEN")
     username = _require_env("BITBUCKET_USERNAME")
     default_project = os.environ.get("BITBUCKET_DEFAULT_PROJECT", "").strip()
-
+    lfs_mode_raw = os.environ.get("BITBUCKET_LFS_MODE", "disabled").strip().lower()
+    if lfs_mode_raw not in ("disabled", "enabled", "auto"):
+        raise ConfigError(
+            f"BITBUCKET_LFS_MODE must be 'disabled', 'enabled', or 'auto', "
+            f"got '{lfs_mode_raw}'"
+        )
+    lfs_mode = lfs_mode_raw
     workspace_dir = Path(
         os.environ.get(
             "BITBUCKET_WORKSPACE", str(Path.home() / "mcp-workspace")
@@ -143,4 +150,5 @@ def load_config() -> ServerConfig:
         max_file_bytes=max_file_bytes,
         session_id=session_id,
         audit_log_path=audit_log_path,
+        lfs_mode=lfs_mode
     )

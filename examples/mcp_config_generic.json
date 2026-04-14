@@ -14,6 +14,30 @@
     "See README.md for the list of supported environment variables",
     "and SECURITY.md for the threat model and deployment requirements."
   ],
+  "_comment_windows_path": [
+    "On Windows, MCP clients such as Claude Desktop spawn the server",
+    "with a sanitized environment that does not inherit the user's full",
+    "PATH. If `git` is installed in a non-standard location (for",
+    "example, inside a portable cmder distribution), the subprocess",
+    "will not find it and all git operations will fail. In that case,",
+    "add an explicit PATH entry to the 'env' block below listing the",
+    "directories that contain git.exe and its helper binaries. Example:",
+    "\"PATH\": \"C:\\\\Program Files\\\\Git\\\\cmd;C:\\\\Program Files\\\\Git\\\\bin;C:\\\\Windows\\\\System32;C:\\\\Windows\"",
+    "On Linux and macOS this is usually not necessary."
+  ],
+  "_comment_lfs": [
+    "BITBUCKET_LFS_MODE controls git-lfs behavior and has three values:",
+    "- 'disabled' (default): LFS filters are bypassed on every git",
+    "  invocation. LFS-tracked files are materialized as pointer files",
+    "  rather than real content. Safe across environments where git-lfs",
+    "  may or may not be installed.",
+    "- 'enabled': LFS filters are left alone. Requires git-lfs to be",
+    "  reachable from the subprocess PATH. On Windows with a portable",
+    "  git, you may need to add the mingw64\\\\bin directory to PATH.",
+    "- 'auto': the server detects git-lfs availability at startup and",
+    "  enables LFS only when the binary is present. Safer than 'enabled'",
+    "  in mixed environments."
+  ],
   "mcpServers": {
     "bitbucket-dc": {
       "command": "bitbucket-dc-mcp",
@@ -26,7 +50,8 @@
         "BITBUCKET_ALLOWED_HOSTS": "bitbucket.example.com",
         "BITBUCKET_GIT_TIMEOUT": "300",
         "BITBUCKET_HTTP_TIMEOUT": "30",
-        "BITBUCKET_MAX_FILE_BYTES": "1048576"
+        "BITBUCKET_MAX_FILE_BYTES": "1048576",
+        "BITBUCKET_LFS_MODE": "disabled"
       }
     }
   }

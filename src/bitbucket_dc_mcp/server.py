@@ -1176,7 +1176,11 @@ async def dispatch_tool(
 # ============================================================
 
 def build_context(config: ServerConfig) -> Context:
-    git = GitRunner(token=config.token, timeout=config.git_timeout)
+    git = GitRunner(
+        token=config.token,
+        timeout=config.git_timeout,
+        lfs_mode=config.lfs_mode,
+    )
     http = BitbucketHttpClient(
         base_url=config.base_url,
         token=config.token,
@@ -1205,6 +1209,11 @@ async def serve(config: ServerConfig) -> None:
     log.info(
         f"  git timeout: {config.git_timeout}s, "
         f"http timeout: {config.http_timeout}s"
+    )
+
+    log.info(
+        f"  lfs mode: {config.lfs_mode} "
+        f"(effective: {ctx.git.lfs_mode})"
     )
 
     ctx.audit.emit(

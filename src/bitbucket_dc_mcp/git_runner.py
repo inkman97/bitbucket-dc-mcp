@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,11 +26,46 @@ class GitRunner:
 
     On Linux and macOS we use the standard subprocess.Popen + communicate
     pattern with PIPE, which is reliable and avoids unnecessary disk I/O.
+
+    LFS handling is controlled by lfs_mode:
+    - "disabled" (default): every invocation bypasses LFS filters via
+      ephemeral -c args. LFS-tracked files are materialized as pointer
+      files rather than real content. Safe and deterministic across
+      environments.
+    - "enabled": LFS filters are left alone. Requires git-lfs in the
+      subprocess PATH. Will hang or fail on repos that require LFS if
+      git-lfs is missing.
+    - "auto": resolved at init time. If shutil.which("git-lfs") finds
+      the binary, lfs_mode becomes "enabled", otherwise "disabled".
+      Lets users opt in to LFS without the risk of deadlocks when the
+      binary is absent.
     """
 
-    def __init__(self, token: str, timeout: int) -> None:
+    def __init__(
+            self,
+            token: str,
+            timeout: int,
+            lfs_mode: str = "disabled",
+    ) -> None:
         self._token = token
         self._timeout = timeout
+        self._lfs_mode = self._resolve_lfs_mode(lfs_mode)
+
+    @staticmethod
+    def _resolve_lfs_mode(mode: str) -> str:
+        if mode not in ("disabled", "enabled", "auto"):
+            raise ValueError(
+                f"lfs_mode must be 'disabled', 'enabled', or 'auto', "
+                f"got '{mode}'"
+            )
+        if mode != "auto":
+            return mode
+        return "enabled" if shutil.which("git-lfs") else "disabled"
+
+    @property
+    def lfs_mode(self) -> str:
+        """The effective LFS mode after auto-resolution."""
+        return self._lfs_mode
 
     def run(self, args: list[str], cwd: Path | None = None) -> str:
         cmd = ["git"] + args
@@ -149,19 +185,26 @@ class GitRunner:
 
     def auth_header_args(self) -> list[str]:
         """Return ephemeral -c args so the token is never persisted,
-        no credential helper is consulted, and LFS filters are bypassed.
+        no credential helper is consulted, and LFS filters are bypassed
+        (unless lfs_mode is 'enabled').
         """
-        return [
+        args = [
             "-c",
             "credential.helper=",
-            "-c",
-            "filter.lfs.required=false",
-            "-c",
-            "filter.lfs.smudge=cat",
-            "-c",
-            "filter.lfs.clean=cat",
-            "-c",
-            "filter.lfs.process=",
+        ]
+        if self._lfs_mode == "disabled":
+            args.extend([
+                "-c",
+                "filter.lfs.required=false",
+                "-c",
+                "filter.lfs.smudge=cat",
+                "-c",
+                "filter.lfs.clean=cat",
+                "-c",
+                "filter.lfs.process=",
+            ])
+        args.extend([
             "-c",
             f"http.extraheader=Authorization: Bearer {self._token}",
-        ]
+        ])
+        return args
