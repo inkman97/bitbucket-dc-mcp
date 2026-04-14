@@ -7,7 +7,9 @@ import sys
 from typing import Any
 
 from mcp.server import Server
+from mcp.server.lowlevel import NotificationOptions
 from mcp.server.stdio import stdio_server
+from mcp.shared.context import RequestContext
 from mcp.types import Tool, TextContent
 
 from .config import ConfigError, ServerConfig, load_config
@@ -16,11 +18,13 @@ from .http_client import BitbucketHttpClient, HttpClientError
 from .logging_setup import AuditLogger, build_operational_logger
 from .validation import (
     ValidationError,
+    resolve_file_in_repo,
     resolve_repo_path,
     validate_branch_name,
     validate_comment_text,
     validate_commit_message,
     validate_description,
+    validate_file_content,
     validate_file_path,
     validate_project_key,
     validate_pull_request_id,
@@ -28,6 +32,63 @@ from .validation import (
     validate_repo_slug,
     validate_title,
 )
+
+
+async def _run_with_progress(
+        coro_factory,
+        session,
+        progress_token,
+        heartbeat_seconds: float = 10.0,
+):
+    """Run a long-running coroutine while sending periodic progress
+    notifications to the MCP client, so the client-side timeout never
+    fires on legitimate long operations.
+
+    `coro_factory` must be a zero-argument callable that returns the
+    coroutine to run. This lets us pass something like
+    `lambda: asyncio.to_thread(ctx.git.run, ...)` and only invoke it
+    inside this helper.
+
+    If `progress_token` is None (client did not request progress), we
+    just run the coroutine without sending anything.
+    """
+    main_task = asyncio.create_task(coro_factory())
+
+    if progress_token is None:
+        return await main_task
+
+    progress = 0
+
+    async def heartbeat() -> None:
+        nonlocal progress
+        while not main_task.done():
+            try:
+                await asyncio.sleep(heartbeat_seconds)
+            except asyncio.CancelledError:
+                return
+            if main_task.done():
+                return
+            progress += 1
+            try:
+                await session.send_progress_notification(
+                    progress_token=progress_token,
+                    progress=progress,
+                    total=None,
+                )
+            except Exception:
+                # Never let heartbeat failures kill the main task.
+                return
+
+    hb_task = asyncio.create_task(heartbeat())
+    try:
+        result = await main_task
+    finally:
+        hb_task.cancel()
+        try:
+            await hb_task
+        except asyncio.CancelledError:
+            pass
+    return result
 
 
 class Context:
@@ -281,6 +342,89 @@ def build_tools(config: ServerConfig) -> list[Tool]:
                 "required": ["repo_slug", "pull_request_id", "text"],
             },
         ),
+        Tool(
+            name="bitbucket_write_file",
+            description=(
+                "[WRITE] Write or overwrite a file in a locally cloned repo. "
+                "Creates parent directories as needed. The file is written "
+                "in UTF-8 encoding. The repo must already be cloned via "
+                "bitbucket_clone_repo."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_slug": {"type": "string"},
+                    "file_path": {
+                        "type": "string",
+                        "description": (
+                            "Repo-relative path, e.g. "
+                            "'src/main/java/Foo.java'"
+                        ),
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full file content in UTF-8",
+                    },
+                },
+                "required": ["repo_slug", "file_path", "content"],
+            },
+        ),
+        Tool(
+            name="bitbucket_edit_file",
+            description=(
+                "[WRITE] Replace a single unique occurrence of old_str with "
+                "new_str in a file in a locally cloned repo. Fails if old_str "
+                "is not found or found more than once. Use this for surgical "
+                "edits where you know the exact text to replace."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_slug": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "old_str": {
+                        "type": "string",
+                        "description": (
+                            "Exact text to replace, must match byte-for-byte "
+                            "and appear exactly once in the file"
+                        ),
+                    },
+                    "new_str": {
+                        "type": "string",
+                        "description": "Replacement text",
+                    },
+                },
+                "required": [
+                    "repo_slug",
+                    "file_path",
+                    "old_str",
+                    "new_str",
+                ],
+            },
+        ),
+        Tool(
+            name="bitbucket_apply_patch",
+            description=(
+                "[WRITE] Apply a unified diff patch to a locally cloned "
+                "repo using 'git apply'. Use this for multi-file changes "
+                "or when a diff is more natural than individual edits. "
+                "The patch must be in unified diff format."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_slug": {"type": "string"},
+                    "patch_content": {
+                        "type": "string",
+                        "description": (
+                            "Full unified diff text, starting with "
+                            "'diff --git' or '---' headers"
+                        ),
+                    },
+                },
+                "required": ["repo_slug", "patch_content"],
+            },
+        ),
     ]
 
 
@@ -288,7 +432,12 @@ def build_tools(config: ServerConfig) -> list[Tool]:
 # TOOL IMPLEMENTATIONS
 # ============================================================
 
-async def tool_clone_repo(ctx: Context, args: dict) -> str:
+async def tool_clone_repo(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     project = validate_project_key(
         args.get("project_key"), default=ctx.config.default_project
@@ -299,25 +448,53 @@ async def tool_clone_repo(ctx: Context, args: dict) -> str:
     auth = ctx.git.auth_header_args()
 
     if repo_path.exists():
-        ctx.git.run(auth + ["fetch", "origin"], cwd=repo_path)
+        await _run_with_progress(
+            lambda: asyncio.to_thread(
+                ctx.git.run, auth + ["fetch", "origin"], repo_path
+            ),
+            session,
+            progress_token,
+        )
         try:
-            head_ref = ctx.git.run(
-                ["symbolic-ref", "refs/remotes/origin/HEAD"], cwd=repo_path
-            ).strip()
-            default_branch = head_ref.split("/")[-1]
+            head_ref_raw = await asyncio.to_thread(
+                ctx.git.run,
+                ["symbolic-ref", "refs/remotes/origin/HEAD"],
+                repo_path,
+            )
+            default_branch = head_ref_raw.strip().split("/")[-1]
         except GitError:
             default_branch = "master"
-        ctx.git.run(["checkout", default_branch], cwd=repo_path)
-        ctx.git.run(
-            auth + ["pull", "origin", default_branch], cwd=repo_path
+        await asyncio.to_thread(
+            ctx.git.run, ["checkout", default_branch], repo_path
+        )
+        await _run_with_progress(
+            lambda: asyncio.to_thread(
+                ctx.git.run,
+                auth + ["pull", "origin", default_branch],
+                repo_path,
+            ),
+            session,
+            progress_token,
         )
         return f"Repository updated at {repo_path} (branch: {default_branch})"
     else:
-        ctx.git.run(auth + ["clone", clone_url, str(repo_path)])
+        await _run_with_progress(
+            lambda: asyncio.to_thread(
+                ctx.git.run,
+                auth + ["clone", clone_url, str(repo_path)],
+            ),
+            session,
+            progress_token,
+        )
         return f"Repository cloned at {repo_path}"
 
 
-async def tool_create_branch(ctx: Context, args: dict) -> str:
+async def tool_create_branch(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     branch_name = validate_branch_name(args["branch_name"])
     repo_path = resolve_repo_path(ctx.config.workspace_dir, repo_slug)
@@ -326,42 +503,66 @@ async def tool_create_branch(ctx: Context, args: dict) -> str:
             f"repo '{repo_slug}' is not cloned. "
             f"Call bitbucket_clone_repo first."
         )
-    ctx.git.run(["checkout", "-b", branch_name], cwd=repo_path)
+    await asyncio.to_thread(
+        ctx.git.run, ["checkout", "-b", branch_name], repo_path
+    )
     return f"Branch {branch_name} created and checked out at {repo_path}"
 
 
-async def tool_commit_changes(ctx: Context, args: dict) -> str:
+async def tool_commit_changes(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     message = validate_commit_message(args["commit_message"])
     repo_path = resolve_repo_path(ctx.config.workspace_dir, repo_slug)
     if not repo_path.exists():
         raise ValidationError(f"repo '{repo_slug}' is not cloned")
-    ctx.git.run(["add", "-A"], cwd=repo_path)
-    status = ctx.git.run(["status", "--porcelain"], cwd=repo_path)
+    await asyncio.to_thread(ctx.git.run, ["add", "-A"], repo_path)
+    status = await asyncio.to_thread(
+        ctx.git.run, ["status", "--porcelain"], repo_path
+    )
     if not status.strip():
         return "No changes to commit."
-    ctx.git.run(["commit", "-m", message], cwd=repo_path)
-    short_sha = ctx.git.run(
-        ["rev-parse", "--short", "HEAD"], cwd=repo_path
-    ).strip()
+    await asyncio.to_thread(
+        ctx.git.run, ["commit", "-m", message], repo_path
+    )
+    short_sha_raw = await asyncio.to_thread(
+        ctx.git.run, ["rev-parse", "--short", "HEAD"], repo_path
+    )
+    short_sha = short_sha_raw.strip()
     first_line = message.splitlines()[0][:80]
     return f"Commit {short_sha} created: {first_line}"
 
 
-async def tool_push_branch(ctx: Context, args: dict) -> str:
+async def tool_push_branch(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     branch_name = validate_branch_name(args["branch_name"])
     repo_path = resolve_repo_path(ctx.config.workspace_dir, repo_slug)
     if not repo_path.exists():
         raise ValidationError(f"repo '{repo_slug}' is not cloned")
     auth = ctx.git.auth_header_args()
-    ctx.git.run(
-        auth + ["push", "-u", "origin", branch_name], cwd=repo_path
+    await asyncio.to_thread(
+        ctx.git.run,
+        auth + ["push", "-u", "origin", branch_name],
+        repo_path,
     )
     return f"Branch {branch_name} pushed to origin."
 
 
-async def tool_create_pull_request(ctx: Context, args: dict) -> str:
+async def tool_create_pull_request(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     source = validate_branch_name(args["source_branch"])
     target = validate_branch_name(args.get("target_branch", "master"))
@@ -401,7 +602,12 @@ async def tool_create_pull_request(ctx: Context, args: dict) -> str:
     return f"PR #{pr_id} created: {pr_url}"
 
 
-async def tool_get_repo_info(ctx: Context, args: dict) -> str:
+async def tool_get_repo_info(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     project = validate_project_key(
         args.get("project_key"), default=ctx.config.default_project
@@ -439,7 +645,12 @@ async def tool_get_repo_info(ctx: Context, args: dict) -> str:
     )
 
 
-async def tool_list_branches(ctx: Context, args: dict) -> str:
+async def tool_list_branches(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     project = validate_project_key(
         args.get("project_key"), default=ctx.config.default_project
@@ -457,7 +668,12 @@ async def tool_list_branches(ctx: Context, args: dict) -> str:
     return "\n".join(lines)
 
 
-async def tool_get_file_content(ctx: Context, args: dict) -> str:
+async def tool_get_file_content(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     file_path = validate_file_path(args["file_path"])
     branch = validate_branch_name(args.get("branch", "master"))
@@ -503,7 +719,12 @@ async def tool_get_file_content(ctx: Context, args: dict) -> str:
     return f"File {file_path}:\n\n{content}"
 
 
-async def tool_list_files(ctx: Context, args: dict) -> str:
+async def tool_list_files(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     branch = validate_branch_name(args.get("branch", "master"))
     project = validate_project_key(
@@ -554,7 +775,12 @@ async def tool_list_files(ctx: Context, args: dict) -> str:
     return f"{header}\n{body}"
 
 
-async def tool_list_pull_requests(ctx: Context, args: dict) -> str:
+async def tool_list_pull_requests(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     project = validate_project_key(
         args.get("project_key"), default=ctx.config.default_project
@@ -591,7 +817,12 @@ async def tool_list_pull_requests(ctx: Context, args: dict) -> str:
     return "\n".join(lines)
 
 
-async def tool_get_pull_request(ctx: Context, args: dict) -> str:
+async def tool_get_pull_request(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     pr_id = validate_pull_request_id(args["pull_request_id"])
     project = validate_project_key(
@@ -639,7 +870,12 @@ async def tool_get_pull_request(ctx: Context, args: dict) -> str:
     return "\n".join(out)
 
 
-async def tool_get_pull_request_diff(ctx: Context, args: dict) -> str:
+async def tool_get_pull_request_diff(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     pr_id = validate_pull_request_id(args["pull_request_id"])
     project = validate_project_key(
@@ -655,7 +891,10 @@ async def tool_get_pull_request_diff(ctx: Context, args: dict) -> str:
 
 
 async def tool_get_pull_request_comments(
-        ctx: Context, args: dict
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
 ) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     pr_id = validate_pull_request_id(args["pull_request_id"])
@@ -706,7 +945,10 @@ async def tool_get_pull_request_comments(
 
 
 async def tool_add_pull_request_comment(
-        ctx: Context, args: dict
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
 ) -> str:
     repo_slug = validate_repo_slug(args["repo_slug"])
     pr_id = validate_pull_request_id(args["pull_request_id"])
@@ -724,6 +966,140 @@ async def tool_add_pull_request_comment(
     comment_id = result.get("id", "?")
     return f"Comment #{comment_id} added to PR #{pr_id}."
 
+async def tool_write_file(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
+    repo_slug = validate_repo_slug(args["repo_slug"])
+    file_path_arg = args["file_path"]
+    content = validate_file_content(
+        args["content"], ctx.config.max_file_bytes
+    )
+    repo_path = resolve_repo_path(ctx.config.workspace_dir, repo_slug)
+    if not repo_path.exists():
+        raise ValidationError(
+            f"repo '{repo_slug}' is not cloned. "
+            f"Call bitbucket_clone_repo first."
+        )
+    target = resolve_file_in_repo(
+        ctx.config.workspace_dir, repo_slug, file_path_arg
+    )
+
+    def _write() -> int:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return target.stat().st_size
+
+    size = await asyncio.to_thread(_write)
+    return f"Wrote {size} bytes to {target.relative_to(repo_path)}"
+
+
+async def tool_edit_file(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
+    repo_slug = validate_repo_slug(args["repo_slug"])
+    file_path_arg = args["file_path"]
+    old_str = args["old_str"]
+    new_str = args["new_str"]
+    if not isinstance(old_str, str) or not isinstance(new_str, str):
+        raise ValidationError("old_str and new_str must be strings")
+    if old_str == "":
+        raise ValidationError("old_str cannot be empty")
+    repo_path = resolve_repo_path(ctx.config.workspace_dir, repo_slug)
+    if not repo_path.exists():
+        raise ValidationError(
+            f"repo '{repo_slug}' is not cloned. "
+            f"Call bitbucket_clone_repo first."
+        )
+    target = resolve_file_in_repo(
+        ctx.config.workspace_dir, repo_slug, file_path_arg
+    )
+    if not target.exists():
+        raise ValidationError(
+            f"file '{file_path_arg}' does not exist in repo"
+        )
+
+    def _edit() -> tuple[int, int]:
+        original = target.read_text(encoding="utf-8")
+        occurrences = original.count(old_str)
+        if occurrences == 0:
+            raise ValidationError(
+                f"old_str not found in {file_path_arg}"
+            )
+        if occurrences > 1:
+            raise ValidationError(
+                f"old_str found {occurrences} times in "
+                f"{file_path_arg}, must be unique"
+            )
+        updated = original.replace(old_str, new_str, 1)
+        size = len(updated.encode("utf-8"))
+        if size > ctx.config.max_file_bytes:
+            raise ValidationError(
+                f"resulting file would be {size} bytes, "
+                f"max is {ctx.config.max_file_bytes}"
+            )
+        target.write_text(updated, encoding="utf-8")
+        return len(old_str), len(new_str)
+
+    old_len, new_len = await asyncio.to_thread(_edit)
+    return (
+        f"Replaced {old_len}-char block with {new_len}-char block "
+        f"in {target.relative_to(repo_path)}"
+    )
+
+
+async def tool_apply_patch(
+        ctx: Context,
+        args: dict,
+        session=None,
+        progress_token=None,
+) -> str:
+    repo_slug = validate_repo_slug(args["repo_slug"])
+    patch_content = args["patch_content"]
+    if not isinstance(patch_content, str):
+        raise ValidationError("patch_content must be a string")
+    if len(patch_content.encode("utf-8")) > ctx.config.max_file_bytes:
+        raise ValidationError(
+            f"patch exceeds max size of {ctx.config.max_file_bytes} bytes"
+        )
+    repo_path = resolve_repo_path(ctx.config.workspace_dir, repo_slug)
+    if not repo_path.exists():
+        raise ValidationError(
+            f"repo '{repo_slug}' is not cloned. "
+            f"Call bitbucket_clone_repo first."
+        )
+
+    # Write the patch to a temp file inside the repo workspace, then
+    # run `git apply` on it. Temp file in workspace (not system tmp)
+    # so it stays inside the audited area.
+    import tempfile
+    import os
+
+    def _apply() -> str:
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".patch", dir=str(ctx.config.workspace_dir)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(patch_content)
+            ctx.git.run(
+                ["apply", "--verbose", tmp_path],
+                cwd=repo_path,
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return "ok"
+
+    await asyncio.to_thread(_apply)
+    return f"Patch applied successfully to {repo_slug}"
 
 # ============================================================
 # DISPATCHER
@@ -735,6 +1111,9 @@ TOOL_IMPLEMENTATIONS = {
     "bitbucket_commit_changes": tool_commit_changes,
     "bitbucket_push_branch": tool_push_branch,
     "bitbucket_create_pull_request": tool_create_pull_request,
+    "bitbucket_write_file": tool_write_file,
+    "bitbucket_edit_file": tool_edit_file,
+    "bitbucket_apply_patch": tool_apply_patch,
     "bitbucket_get_repo_info": tool_get_repo_info,
     "bitbucket_list_branches": tool_list_branches,
     "bitbucket_get_file_content": tool_get_file_content,
@@ -748,7 +1127,11 @@ TOOL_IMPLEMENTATIONS = {
 
 
 async def dispatch_tool(
-        ctx: Context, name: str, arguments: dict[str, Any]
+        ctx: Context,
+        name: str,
+        arguments: dict[str, Any],
+        session=None,
+        progress_token=None,
 ) -> str:
     """Route the call to the right tool and produce an audit trail."""
     impl = TOOL_IMPLEMENTATIONS.get(name)
@@ -759,7 +1142,11 @@ async def dispatch_tool(
         )
         return f"Unknown tool: {name}"
     try:
-        result = await impl(ctx, arguments)
+        result = await impl(
+            ctx, arguments,
+            session=session,
+            progress_token=progress_token,
+        )
         ctx.audit.emit(
             name, arguments, result[:500], outcome="success",
         )
@@ -838,7 +1225,19 @@ async def serve(config: ServerConfig) -> None:
             name: str, arguments: dict[str, Any]
     ) -> list[TextContent]:
         log.info(f"tool invocation: {name}")
-        result = await dispatch_tool(ctx, name, arguments)
+        # The current request context is available via the server's
+        # request_context attribute during the call.
+        req_ctx = mcp.request_context
+        progress_token = None
+        if req_ctx and req_ctx.meta:
+            progress_token = req_ctx.meta.progressToken
+        session = req_ctx.session if req_ctx else None
+
+        result = await dispatch_tool(
+            ctx, name, arguments,
+            session=session,
+            progress_token=progress_token,
+        )
         return [TextContent(type="text", text=result)]
 
     async with stdio_server() as (read_stream, write_stream):

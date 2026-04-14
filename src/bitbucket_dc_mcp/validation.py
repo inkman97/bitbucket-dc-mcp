@@ -171,3 +171,41 @@ def resolve_repo_path(workspace_dir: Path, repo_slug: str) -> Path:
             "resolved repo path escapes workspace directory"
         ) from e
     return candidate
+
+def validate_file_content(content: str, max_bytes: int) -> str:
+    """Validate content for write/edit operations.
+
+    Ensures the content is a string and does not exceed the max size.
+    """
+    if not isinstance(content, str):
+        raise ValidationError("content must be a string")
+    size = len(content.encode("utf-8"))
+    if size > max_bytes:
+        raise ValidationError(
+            f"content is {size} bytes, max is {max_bytes}"
+        )
+    return content
+
+
+def resolve_file_in_repo(
+        workspace_dir: Path,
+        repo_slug: str,
+        file_path: str,
+) -> Path:
+    """Resolve a file path inside a cloned repo, preventing escape.
+
+    Returns an absolute Path that is guaranteed to be inside the repo
+    directory. Raises ValidationError if the resolved path would escape.
+    """
+    repo_path = resolve_repo_path(workspace_dir, repo_slug)
+    # Use validate_file_path first to reject obviously bad patterns
+    clean_rel = validate_file_path(file_path)
+    target = (repo_path / clean_rel).resolve()
+    # Ensure target is under the repo path
+    try:
+        target.relative_to(repo_path.resolve())
+    except ValueError:
+        raise ValidationError(
+            f"file_path '{file_path}' escapes the repository directory"
+        )
+    return target
